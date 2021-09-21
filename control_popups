@@ -1,0 +1,256 @@
+# -*- coding: UTF-8 -*-
+##############################################################################
+# CustomClass Rules                                                          #
+# =================                                                          #
+#                                                                            #
+#1. All custom classes must inherit sreb.EBObject and the constructor        #
+#   must call sreb.EBObject's constructor. If a class starts with _ then it  #
+#   is considered internal and will not be treated as a custom class.        #
+#                                                                            #
+#2. The custom class will only use the default constructor.                  #  
+#   ie. a constructor with no parameters.                                    #
+#                                                                            #
+#3. To add a property provide getter and have an attribute that does not     #
+#   starts with an underscore(_) or an upper case letter, and have the       #
+#   attribute of a know type. Known types are int,float,str,EBPoint,EBColor, #
+#   tuple, and list.                                                         #
+#   If an attribute's default value is of type tuple and only has two        #
+#   items, the property will be treated as an EBPoint. Similarly, if an      #
+#   attribute's default value is a tuple of 3 items the property will be     #
+#   treated as an EBColor.  The input type of the setter and the output type #
+#   of the getter is expected to be the same as the type of the attribute.   #
+#                                                                            #
+#4. If only getter is provided, the property will be a readonly property.    # 
+#                                                                            #
+#6. The custom class may be instanciated during development to obtain        # 
+#   class info. Avoid such things as display mode change, remote connections # 
+#   in the constructor.                                                      #
+#                                                                            # 
+#7. Any method in the custom class can be called using the Execute action    #
+#   By default, the return type of the method is string unless a doc string  #
+#   with the following constraint is available                               #
+#	a. The doc string starts with "RETURN:" (case matters)               #
+#       b. Following the text "RETURN:" provide a default value of the type  #
+#          or the __repr__ value of the class. eg. str for string            #
+#8. If a property's setter metthod has default values for it's parameters,   #
+#    the property will not accept references or equation.                    #
+##############################################################################
+
+
+import sreb
+import sreb.time
+import pylink
+import os
+import shutil
+import sreb.graphics
+import pygame
+
+
+
+
+class CustomClassTemplate(sreb.EBObject):
+	def __init__(self):
+		sreb.EBObject.__init__(self)
+		self.displayScreenPath=''	# String used to get the path of the Display screen action in the expt graph
+		self.popupDuration = 3000  #this is the duration of each popup.  Change the value here to change it for the experiment
+
+		self.trialNumber = 1  #this stores the current trial number
+
+		self.currentPopupFinished = 0  #this changes to 1 whenever a popup is finished.  It is checked by the CHECK_FINISHED_CURRENT_POPUP trigger in the SHOW_POPUPS sequence
+		self.transparencyColor = [0,0,0] #this variable sets the transparency color of subtitle images.  It should be set to the same color as the Background Color
+									#of the Multiline Text Resource in the DISPLAY_SCREEN_SUBTITLE action of the Video_Generate_Subtitle_Image_And_IAS project
+
+	#this method makes the self.currentPopupFinished variable readable from the GUI
+	def getCurrentPopupFinished(self):
+		return self.currentPopupFinished
+
+	#These methods make the node path of the Display Screen action accessible from the GUI.  The CUSTOM_CLASS_INSTANCE has a property that references the DISPLAY_VIDEO action
+	def getDisplayScreenPath(self):
+		return self.displayScreenPath	
+	def setDisplayScreenPath(self,s):
+		self.displayScreenPath=s
+		
+
+	#This method initializes the Custom Class Drawing Resources
+	def initialize(self,EDFname,displayRefreshRate):
+		#Get the screen handle.
+		self.screen=sreb.graphics.getScreenFromPath(self.getDisplayScreenPath())	
+		if self.screen is None:
+			raise "EBScreen could not be accessed"
+
+		#this grabs the width/height of the screen in pixels
+		self.screenWidth, self.screenHeight = self.screen.getSize()
+
+		#This is the drawing resource for the popups
+		#The "False" parameter indicates that the resource is created with a hardware-based resource surface 
+		#This ensures a faster display drawing to the back buffer;
+		self.customResource = self.screen.createCustomResource(sreb.EBRectangle(0, 0, self.screenWidth, self.screenHeight),False)
+		
+		#Two methods used to determine whether a display drawing should be performed 
+		# and how to redo the drawing.
+		self.customResource.setDrawMethodPointer(self.redraw)
+		self.customResource.setShouldRedrawMethodPointer(self.shouldRedraw)
+		
+		#this is a transparency color, used to allow the popup drawing surface to be cleared (so old popups don't linger)
+		self.customResource.pygameSurface.set_colorkey(self.transparencyColor)
+
+		#this stores the current session name
+		self.edfName = EDFname
+	
+		#this determines how long between screen retraces.  Is used in the logic determining when to redraw
+		self.retraceInterval = 1000.0/displayRefreshRate
+
+
+	#this method is called at the beginning of each trial to reset some variable values
+	def resetTrial(self):
+
+		
+		self.videoStartTime = 0  #this will store the time of the video onset
+		self.doPopupChecks = 0   #this will be 1 when it is time to start checking whether to present popups
+		self.currentPopupStatus = 0  #this is 0 if popup currently not presented, 1 if it is
+
+		#this grabs the current EDF filename (for use in determining file paths)
+		self.sessionName = self.edfName.replace(".edf","")
+
+		#this sets the filename for the ias file for the current trial
+		self.iasFilename = "iasTrial_%03d.ias"%(self.trialNumber)
+		#increment the current trial number
+		self.trialNumber = self.trialNumber + 1
+
+		
+		
+		#open file for writing dynamic interest area information
+		self.iasFile = open("./results/" + self.sessionName + "/aoi/" + self.iasFilename, 'wt')
+
+		#this will store the time of the current popup onset
+		self.currentPopupStartTime = 0
+
+		#this stores the current popup index
+		self.currentPopupIndex = 0
+	
+
+		
+	#this method logs the start time of the video right.  It's called right after the video starts
+	def storeVideoStartTime(self,videoStartTime):
+
+		#log the video start time (passed from the GUI by the STORE_VIDEO_START_TIME action
+		self.videoStartTime = int(round(videoStartTime))
+
+		#it's not time to present the popup, so reset this to 0
+		self.currentPopupStatus = 0
+
+
+		#determine the difference between the current time and the time the video started (this is used as prefix for message -- that duration
+		#will automatically be subtracted from the message timestamp to put the message in the appropirate time position
+		offset = int(round(sreb.time.getCurrentTime() - self.videoStartTime))
+
+		#send message marking onset of the video
+		message = str(offset) + " VIDEO_ONSET"
+		pylink.getEYELINK().sendMessage(message)
+
+		#send message pointing to interest area set file for the trial (time of this message will be 0 point for dynamic interest area time info
+		message = str(offset) + " !V IAREA FILE /aoi/" + self.iasFilename
+		pylink.getEYELINK().sendMessage(message)
+
+	#this method grabs new popup info every time we cycle back to a new row/iteration of the SHOW_POPUPS sequence
+	def startNewPopupPhase(self,currentPopupOnsetTime,popupEventType,popupImageFile,popupImageLocation):
+	
+		#grab the minutes, seconds out of the time info from the SHOW_POPUPS Data Source row
+		timesList = currentPopupOnsetTime.split(":")
+		
+		#convert to msec and determine intended onset and offset time
+		self.currentPopupOnsetTime = int(round(float(timesList[0]) * 60000 + float(timesList[1]) * 1000)) #convert time to msec
+		self.currentPopupOnsetTime = self.currentPopupOnsetTime + self.videoStartTime #add video start time
+		self.currentPopupOffsetTime = self.currentPopupOnsetTime + self.popupDuration #add popup duration
+
+		#increment the popup index
+		self.currentPopupIndex = self.currentPopupIndex + 1
+		#log the popup event type (for IA label purposes later)
+		self.currentPopupEventType = popupEventType
+
+		#set up the image info for drawing/interest area logging purposes later
+		self.currentImageToBlit = pygame.image.load('./library/images/' + popupImageFile)
+		self.currentImageFilename = popupImageFile
+		currentImageWidth = self.currentImageToBlit.get_width()
+		currentImageHeight = self.currentImageToBlit.get_height()
+		currentImageLocation = popupImageLocation
+		self.currentImageBoundaries = [currentImageLocation[0] - currentImageWidth/2,currentImageLocation[1] - currentImageHeight/2,\
+			currentImageLocation[0] + currentImageWidth/2,currentImageLocation[1] + currentImageHeight/2]
+
+		#set variable indicating we are not finished with the current popup -- it will become 1 when we are
+		self.currentPopupFinished = 0
+
+		#set up our drawing methods so that it will start potentially drawing
+		self.doPopupChecks = 1
+
+
+	#this method stops popup checking/drawing after we've gone through all of them and closes the IAS file for the trial
+	def endPopupChecking(self):
+		self.doPopupChecks = 0
+		self.iasFile.close()
+
+	#this method gets called in advance of every screen retrace (as long as shouldRedraw below returns true)
+	#and is used to actually draw to the screen (note, drawing doesn't actually occur until time of upcoming monitor retrace)
+	def redraw(self):
+		#as long as we are ready to start checking for popups
+		if self.doPopupChecks == 1:
+			#fill our custom resource in front of video with transparent color (this clears any old popups)
+			self.customResource.fill(self.transparencyColor)
+			
+			#if we are not current drawing popup, check whether we should be
+			if self.currentPopupStatus == 0:
+				#get time of upcoming retrace
+				nextRefreshTime = self.screen.getTimeOfNextRetrace()
+				#if that upcoming retrace is time to draw popup then send message to mark time of onset
+				if nextRefreshTime + self.retraceInterval/2.0 >= self.currentPopupOnsetTime:
+					offset = int(round(sreb.time.getCurrentTime() - nextRefreshTime))
+					message = str(offset) + " POPUP_ONSET_%03d_%s"%(self.currentPopupIndex,self.currentPopupEventType) 
+					pylink.getEYELINK().sendMessage(message)
+					#log time when the popup starts (for IAS file writing later)
+					self.currentPopupStartTime = int(round(nextRefreshTime))
+					self.currentPopupStatus = 1
+					
+			#if we are already in popup drawing period check whether it's time to end that
+			elif self.currentPopupStatus == 1:	
+				#get time of upcoming retrace
+				nextRefreshTime = self.screen.getTimeOfNextRetrace()
+				#if that upcoming retrace is time to remove popup then send message to mark time of offset
+				if nextRefreshTime + self.retraceInterval/2.0 >= self.currentPopupOffsetTime:
+					offset = int(round(sreb.time.getCurrentTime() - nextRefreshTime))
+					message = str(offset) + " POPUP_OFFSET_%03d_%s"%(self.currentPopupIndex,self.currentPopupEventType) 
+					pylink.getEYELINK().sendMessage(message)
+					currentPopupEndTime = int(round(nextRefreshTime))
+
+					#log to dynamic IAS file for popup that just ended 
+					textToWrite = "-" + str(self.currentPopupStartTime - self.videoStartTime) + "\t-" + str(currentPopupEndTime - self.videoStartTime) + \
+						"\tRECTANGLE\t" + str(self.currentPopupIndex) + "\t" + str(self.currentImageBoundaries[0]) + "\t" + str(self.currentImageBoundaries[1]) + \
+						"\t" + str(self.currentImageBoundaries[2]) + "\t" + str(self.currentImageBoundaries[3]) + "\t" + self.currentPopupEventType + \
+						"_%03d"%(self.currentPopupIndex) + "\n"
+					self.iasFile.write(textToWrite)
+					currentPopupEndTime = int(round(nextRefreshTime))
+					self.currentPopupStatus = 0
+					self.currentPopupFinished = 1
+
+		#if we should be drawing a popup then draw it
+		if self.currentPopupStatus == 1:
+			#draw the popup
+			self.customResource.pygameSurface.blit(self.currentImageToBlit,[self.currentImageBoundaries[0],self.currentImageBoundaries[1]])
+
+
+			#the following lines commented out, cause Data Viewer currently doesn't support video and image playback simultaneously
+			#offset = int(round(nextRetraceTime - sreb.time.getCurrentTime())) - 1
+			#message = str(offset) + " !V IMGLOAD TOP_LEFT ../../library/images/" + self.currentImageFilename + " " + \
+			#str(self.currentImageBoundaries[0]) + " " + str(self.currentImageBoundaries[1])
+			#pylink.getEYELINK().sendMessage(message)
+		
+
+	#this method gets called in advance of each retrace.  If it returns true the redraw method gets executed (it doesn't otherwise)
+	def shouldRedraw(self):
+		if self.doPopupChecks == 1:
+			return True
+		else:
+			return False
+		
+
+		
+	
